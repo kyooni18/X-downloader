@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import asyncio
 from pathlib import Path
 from typing import Optional
@@ -7,32 +8,52 @@ import yt_dlp
 
 COOKIES_FILE = os.getenv("COOKIES_FILE", "")
 
-DOWNLOADS_DIR = Path("downloads")
-DOWNLOADS_DIR.mkdir(exist_ok=True)
-
 X_URL_PATTERN = re.compile(
     r"https?://(www\.)?(twitter\.com|x\.com)/\w+/status/(\d+)"
 )
 
+# Simple in-memory cache: url -> (timestamp, media_list)
+_cache: dict[str, tuple[float, list[dict]]] = {}
+CACHE_TTL = 300  # 5 minutes
+
 
 def is_valid_x_url(url: str) -> bool:
-    return bool(X_URL_PATTERN.match(url))
+    return bool(X_URL_PATTERN.match(url.replace("twitter.com", "x.com")))
 
 
 def normalize_url(url: str) -> str:
     return re.sub(r"https?://(www\.)?twitter\.com", "https://x.com", url)
 
 
-def _download_media(url: str, output_dir: Path) -> list[dict]:
-    """Download all media from a tweet and return metadata list."""
-    downloaded = []
+def _detect_media_type(ext: str) -> str:
+    ext = ext.lower().lstrip(".")
+    if ext in {"mp4", "webm", "mov", "avi", "mkv", "m4v"}:
+        return "video"
+    if ext in {"jpg", "jpeg", "png", "gif", "webp"}:
+        return "image"
+    return "other"
 
+
+def _get_content_type(ext: str) -> str:
+    mapping = {
+        "mp4": "video/mp4",
+        "webm": "video/webm",
+        "mov": "video/quicktime",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "gif": "image/gif",
+        "webp": "image/webp",
+        "m4a": "audio/mp4",
+    }
+    return mapping.get(ext.lower().lstrip("."), "application/octet-stream")
+
+
+def _extract(url: str) -> list[dict]:
+    """Extract media info without downloading (blocking)."""
     ydl_opts = {
-        "outtmpl": str(output_dir / "%(id)s_%(autonumber)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
-        "writeinfojson": False,
-        "writethumbnail": False,
         "noplaylist": True,
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
     }
@@ -40,69 +61,77 @@ def _download_media(url: str, output_dir: Path) -> list[dict]:
         ydl_opts["cookiefile"] = COOKIES_FILE
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        info = ydl.extract_info(url, download=False)
 
     tweet_id = info.get("id", "unknown")
     uploader = info.get("uploader", "unknown")
-    title = info.get("title", "")
     upload_date = info.get("upload_date", "")
+    title = info.get("title", "")
 
     entries = info.get("entries") or [info]
-    for entry in entries:
+    results = []
+    for i, entry in enumerate(entries):
         if not entry:
             continue
-        filepath_str = entry.get("requested_downloads", [{}])[0].get("filepath")
-        if not filepath_str:
+
+        formats = entry.get("formats") or []
+        if formats:
+            # Pick the best available format that has a direct URL
+            best = next(
+                (f for f in reversed(formats) if f.get("url") and not f.get("manifest_url")),
+                formats[-1],
+            )
+            direct_url = best.get("url", "")
+            http_headers = best.get("http_headers", {})
+            ext = best.get("ext", "mp4")
+            width = best.get("width") or entry.get("width")
+            height = best.get("height") or entry.get("height")
+            filesize = best.get("filesize") or best.get("filesize_approx") or entry.get("filesize")
+        else:
+            direct_url = entry.get("url", "")
+            http_headers = entry.get("http_headers", {})
+            ext = entry.get("ext", "jpg")
+            width = entry.get("width")
+            height = entry.get("height")
+            filesize = entry.get("filesize") or entry.get("filesize_approx")
+
+        if not direct_url:
             continue
-        filepath = Path(filepath_str)
-        if filepath.exists():
-            downloaded.append({
-                "tweet_id": tweet_id,
-                "uploader": uploader,
-                "title": title,
-                "upload_date": upload_date,
-                "filename": filepath.name,
-                "size_bytes": filepath.stat().st_size,
-                "media_type": _detect_media_type(filepath.suffix),
-                "url": entry.get("url", ""),
-            })
 
-    # Also handle photos (yt-dlp downloads them as a single entry)
-    if not downloaded:
-        for f in output_dir.glob(f"{tweet_id}_*"):
-            downloaded.append({
-                "tweet_id": tweet_id,
-                "uploader": uploader,
-                "title": title,
-                "upload_date": upload_date,
-                "filename": f.name,
-                "size_bytes": f.stat().st_size,
-                "media_type": _detect_media_type(f.suffix),
-                "url": "",
-            })
+        results.append({
+            "index": i,
+            "tweet_id": tweet_id,
+            "uploader": uploader,
+            "upload_date": upload_date,
+            "title": title,
+            "filename": f"{tweet_id}_{i + 1}.{ext}",
+            "ext": ext,
+            "media_type": _detect_media_type(ext),
+            "content_type": _get_content_type(ext),
+            "direct_url": direct_url,
+            "http_headers": dict(http_headers),
+            "width": width,
+            "height": height,
+            "duration": entry.get("duration"),
+            "filesize": filesize,
+        })
 
-    return downloaded
+    return results
 
 
-def _detect_media_type(suffix: str) -> str:
-    suffix = suffix.lower()
-    if suffix in {".mp4", ".webm", ".mov", ".avi", ".mkv"}:
-        return "video"
-    if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
-        return "image"
-    return "other"
-
-
-async def download_tweet_media(url: str, tweet_dir: Optional[Path] = None) -> list[dict]:
-    """Async wrapper around blocking yt-dlp download."""
+async def extract_media_info(url: str) -> list[dict]:
+    """Async wrapper with in-memory cache."""
     url = normalize_url(url)
     if not is_valid_x_url(url):
-        raise ValueError(f"Invalid X/Twitter URL: {url}")
+        raise ValueError(f"유효한 X/Twitter URL이 아닙니다: {url}")
 
-    match = X_URL_PATTERN.match(url)
-    tweet_id = match.group(3) if match else "unknown"
-    output_dir = tweet_dir or (DOWNLOADS_DIR / tweet_id)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    now = time.monotonic()
+    if url in _cache:
+        ts, data = _cache[url]
+        if now - ts < CACHE_TTL:
+            return data
 
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _download_media, url, output_dir)
+    data = await loop.run_in_executor(None, _extract, url)
+    _cache[url] = (now, data)
+    return data
