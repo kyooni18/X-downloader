@@ -1,4 +1,5 @@
 import os
+import logging
 from typing import Optional
 from contextlib import asynccontextmanager
 from urllib.parse import quote
@@ -8,7 +9,14 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
-from downloader import extract_media_info, stream_via_ytdlp, is_valid_x_url, normalize_url
+from downloader import (
+    CHUNK_SIZE,
+    extract_media_info,
+    open_direct_media_stream,
+    stream_via_ytdlp,
+    is_valid_x_url,
+    normalize_url,
+)
 
 
 @asynccontextmanager
@@ -89,7 +97,7 @@ async def get_info(req: InfoRequest):
     media = [
         MediaItem(
             **{k: v for k, v in item.items()
-               if k not in ("ext", "content_type", "title")},
+               if k not in ("ext", "content_type", "title", "direct_url")},
             stream_url=f"/api/stream?url={encoded_url}&index={item['index']}",
         )
         for item in items
@@ -128,26 +136,51 @@ async def stream_media(
         )
 
     item = items[index]
+    response_headers = {
+        "Content-Disposition": f'attachment; filename="{item["filename"]}"',
+    }
+    media_type = item["content_type"]
+    direct_client = None
+    direct_response = None
 
-    async def generator():
+    direct_url = item.get("direct_url")
+    if direct_url:
+        try:
+            direct_client, direct_response = await open_direct_media_stream(direct_url)
+            upstream_length = direct_response.headers.get("Content-Length")
+            if upstream_length and upstream_length.isdigit():
+                response_headers["Content-Length"] = upstream_length
+            media_type = direct_response.headers.get("Content-Type", media_type)
+        except Exception as exc:
+            logging.warning("direct stream failed, falling back to yt-dlp: %s", exc)
+            direct_client = None
+            direct_response = None
+
+    if direct_response is not None:
+        async def generator():
+            try:
+                async for chunk in direct_response.aiter_bytes(CHUNK_SIZE):
+                    yield chunk
+            finally:
+                await direct_response.aclose()
+                await direct_client.aclose()
+
+        return StreamingResponse(
+            generator(),
+            media_type=media_type,
+            headers=response_headers,
+        )
+
+    async def fallback_generator():
         try:
             async for chunk in stream_via_ytdlp(url, index):
                 yield chunk
         except RuntimeError as exc:
-            # Can't raise HTTPException inside a generator after headers are sent;
-            # just stop — client will see a truncated response.
-            import logging
             logging.error("yt-dlp stream error: %s", exc)
 
-    response_headers = {
-        "Content-Disposition": f'attachment; filename="{item["filename"]}"',
-    }
-    if item.get("filesize"):
-        response_headers["Content-Length"] = str(item["filesize"])
-
     return StreamingResponse(
-        generator(),
-        media_type=item["content_type"],
+        fallback_generator(),
+        media_type=media_type,
         headers=response_headers,
     )
 

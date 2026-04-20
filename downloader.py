@@ -5,6 +5,7 @@ import time
 import asyncio
 from pathlib import Path
 from typing import Optional, AsyncGenerator
+import httpx
 import yt_dlp
 
 COOKIES_FILE = os.getenv("COOKIES_FILE", "")
@@ -59,6 +60,14 @@ def _build_ydl_opts() -> dict:
     return opts
 
 
+def _build_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=None),
+        headers={"Accept-Encoding": "identity"},
+    )
+
+
 def _extract(url: str) -> list[dict]:
     """Extract media metadata without downloading."""
     with yt_dlp.YoutubeDL(_build_ydl_opts()) as ydl:
@@ -105,6 +114,7 @@ def _extract(url: str) -> list[dict]:
             "ext": ext,
             "media_type": _detect_media_type(ext),
             "content_type": _get_content_type(ext),
+            "direct_url": direct_url,
             "width": width,
             "height": height,
             "duration": entry.get("duration"),
@@ -164,3 +174,15 @@ async def stream_via_ytdlp(url: str, index: int) -> AsyncGenerator[bytes, None]:
         rc = await proc.wait()
         if rc != 0:
             raise RuntimeError(f"yt-dlp exited with code {rc}")
+
+
+async def open_direct_media_stream(direct_url: str) -> tuple[httpx.AsyncClient, httpx.Response]:
+    client = _build_http_client()
+    try:
+        request = client.build_request("GET", direct_url)
+        response = await client.send(request, stream=True)
+        response.raise_for_status()
+        return client, response
+    except Exception:
+        await client.aclose()
+        raise
