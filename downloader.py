@@ -1,20 +1,24 @@
 import os
 import re
+import sys
 import time
 import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Optional, AsyncGenerator
 import yt_dlp
 
 COOKIES_FILE = os.getenv("COOKIES_FILE", "")
+CHUNK_SIZE = 64 * 1024
+
+# Pre-merged MP4 preferred — no ffmpeg merge needed, single direct URL
+FORMAT = "best[ext=mp4]/best"
 
 X_URL_PATTERN = re.compile(
     r"https?://(www\.)?(twitter\.com|x\.com)/\w+/status/(\d+)"
 )
 
-# Simple in-memory cache: url -> (timestamp, media_list)
 _cache: dict[str, tuple[float, list[dict]]] = {}
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 300
 
 
 def is_valid_x_url(url: str) -> bool:
@@ -36,31 +40,28 @@ def _detect_media_type(ext: str) -> str:
 
 def _get_content_type(ext: str) -> str:
     mapping = {
-        "mp4": "video/mp4",
-        "webm": "video/webm",
-        "mov": "video/quicktime",
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "png": "image/png",
-        "gif": "image/gif",
-        "webp": "image/webp",
-        "m4a": "audio/mp4",
+        "mp4": "video/mp4", "webm": "video/webm", "mov": "video/quicktime",
+        "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+        "gif": "image/gif", "webp": "image/webp",
     }
     return mapping.get(ext.lower().lstrip("."), "application/octet-stream")
 
 
-def _extract(url: str) -> list[dict]:
-    """Extract media info without downloading (blocking)."""
-    ydl_opts = {
+def _build_ydl_opts() -> dict:
+    opts = {
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "noplaylist": False,
+        "format": FORMAT,
     }
     if COOKIES_FILE and Path(COOKIES_FILE).exists():
-        ydl_opts["cookiefile"] = COOKIES_FILE
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+def _extract(url: str) -> list[dict]:
+    """Extract media metadata without downloading."""
+    with yt_dlp.YoutubeDL(_build_ydl_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
 
     tweet_id = info.get("id", "unknown")
@@ -74,26 +75,22 @@ def _extract(url: str) -> list[dict]:
         if not entry:
             continue
 
-        formats = entry.get("formats") or []
-        if formats:
-            # Pick the best available format that has a direct URL
-            best = next(
-                (f for f in reversed(formats) if f.get("url") and not f.get("manifest_url")),
-                formats[-1],
-            )
-            direct_url = best.get("url", "")
-            http_headers = best.get("http_headers", {})
-            ext = best.get("ext", "mp4")
-            width = best.get("width") or entry.get("width")
-            height = best.get("height") or entry.get("height")
-            filesize = best.get("filesize") or best.get("filesize_approx") or entry.get("filesize")
-        else:
-            direct_url = entry.get("url", "")
-            http_headers = entry.get("http_headers", {})
-            ext = entry.get("ext", "jpg")
-            width = entry.get("width")
-            height = entry.get("height")
-            filesize = entry.get("filesize") or entry.get("filesize_approx")
+        # yt-dlp puts the selected format's URL at the top level after processing
+        direct_url = entry.get("url", "")
+        ext = entry.get("ext", "mp4")
+        width = entry.get("width")
+        height = entry.get("height")
+        filesize = entry.get("filesize") or entry.get("filesize_approx")
+
+        # requested_formats present means separate video+audio streams (needs merge)
+        requested = entry.get("requested_formats") or []
+        if requested:
+            # Use first stream URL as placeholder; streaming will use subprocess
+            direct_url = requested[0].get("url", "")
+            ext = requested[0].get("ext", ext)
+            width = width or requested[0].get("width")
+            height = height or requested[0].get("height")
+            filesize = filesize or requested[0].get("filesize")
 
         if not direct_url:
             continue
@@ -108,8 +105,6 @@ def _extract(url: str) -> list[dict]:
             "ext": ext,
             "media_type": _detect_media_type(ext),
             "content_type": _get_content_type(ext),
-            "direct_url": direct_url,
-            "http_headers": dict(http_headers),
             "width": width,
             "height": height,
             "duration": entry.get("duration"),
@@ -120,7 +115,6 @@ def _extract(url: str) -> list[dict]:
 
 
 async def extract_media_info(url: str) -> list[dict]:
-    """Async wrapper with in-memory cache."""
     url = normalize_url(url)
     if not is_valid_x_url(url):
         raise ValueError(f"유효한 X/Twitter URL이 아닙니다: {url}")
@@ -135,3 +129,36 @@ async def extract_media_info(url: str) -> list[dict]:
     data = await loop.run_in_executor(None, _extract, url)
     _cache[url] = (now, data)
     return data
+
+
+async def stream_via_ytdlp(url: str, index: int) -> AsyncGenerator[bytes, None]:
+    """Stream media directly from X CDN via yt-dlp subprocess — no temp files."""
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--format", FORMAT,
+        "--playlist-items", str(index + 1),  # 1-based
+        "-o", "-",  # pipe to stdout
+        "--quiet",
+        "--no-warnings",
+    ]
+    if COOKIES_FILE and Path(COOKIES_FILE).exists():
+        cmd += ["--cookies", COOKIES_FILE]
+    cmd.append(url)
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        while True:
+            chunk = await proc.stdout.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        proc.stdout.close()
+        rc = await proc.wait()
+        if rc != 0:
+            err = await proc.stderr.read()
+            raise RuntimeError(err.decode(errors="replace").strip())

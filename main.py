@@ -1,16 +1,14 @@
 import os
 from typing import Optional
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 
-import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
-from downloader import extract_media_info, is_valid_x_url
-
-CHUNK_SIZE = 64 * 1024  # 64 KB
+from downloader import extract_media_info, stream_via_ytdlp, is_valid_x_url, normalize_url
 
 
 @asynccontextmanager
@@ -20,8 +18,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="X Media Downloader API",
-    description="X(Twitter) 게시물의 미디어를 서버에 저장하지 않고 클라이언트로 직접 중계합니다.",
-    version="2.0.0",
+    description="X(Twitter) 게시물의 미디어를 서버에 저장하지 않고 클라이언트로 직접 스트리밍합니다.",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -76,10 +74,7 @@ async def health():
 
 @app.post("/api/info", response_model=InfoResponse, summary="미디어 정보 조회")
 async def get_info(req: InfoRequest):
-    """
-    게시물 URL의 모든 미디어 메타데이터와 스트림 URL을 반환합니다.
-    파일은 서버에 저장되지 않습니다.
-    """
+    """게시물 URL의 모든 미디어 메타데이터와 스트림 URL을 반환합니다."""
     try:
         items = await extract_media_info(req.url)
     except ValueError as exc:
@@ -90,10 +85,12 @@ async def get_info(req: InfoRequest):
     if not items:
         raise HTTPException(status_code=404, detail="미디어를 찾을 수 없습니다.")
 
+    encoded_url = quote(req.url, safe="")
     media = [
         MediaItem(
-            **{k: v for k, v in item.items() if k not in ("direct_url", "http_headers", "ext", "content_type", "title")},
-            stream_url=f"/api/stream?url={req.url}&index={item['index']}",
+            **{k: v for k, v in item.items()
+               if k not in ("ext", "content_type", "title")},
+            stream_url=f"/api/stream?url={encoded_url}&index={item['index']}",
         )
         for item in items
     ]
@@ -106,8 +103,14 @@ async def stream_media(
     index: int = Query(0, ge=0, description="미디어 인덱스 (0부터 시작)"),
 ):
     """
-    지정한 미디어를 서버에 저장하지 않고 클라이언트로 직접 스트리밍합니다.
+    yt-dlp subprocess를 통해 미디어를 서버 저장 없이 클라이언트로 직접 스트리밍합니다.
+    HLS, DASH, MP4, 이미지 모두 지원합니다.
     """
+    url = normalize_url(url)
+    if not is_valid_x_url(url):
+        raise HTTPException(status_code=400, detail="유효한 X/Twitter 게시물 URL이 아닙니다.")
+
+    # Fetch metadata for filename / content-type
     try:
         items = await extract_media_info(url)
     except ValueError as exc:
@@ -125,28 +128,26 @@ async def stream_media(
         )
 
     item = items[index]
-    direct_url: str = item["direct_url"]
-    headers: dict = item["http_headers"]
-    content_type: str = item["content_type"]
-    filename: str = item["filename"]
-    filesize: Optional[int] = item.get("filesize")
 
-    async def proxy_stream():
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-            async with client.stream("GET", direct_url, headers=headers) as resp:
-                resp.raise_for_status()
-                async for chunk in resp.aiter_bytes(CHUNK_SIZE):
-                    yield chunk
+    async def generator():
+        try:
+            async for chunk in stream_via_ytdlp(url, index):
+                yield chunk
+        except RuntimeError as exc:
+            # Can't raise HTTPException inside a generator after headers are sent;
+            # just stop — client will see a truncated response.
+            import logging
+            logging.error("yt-dlp stream error: %s", exc)
 
     response_headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Disposition": f'attachment; filename="{item["filename"]}"',
     }
-    if filesize:
-        response_headers["Content-Length"] = str(filesize)
+    if item.get("filesize"):
+        response_headers["Content-Length"] = str(item["filesize"])
 
     return StreamingResponse(
-        proxy_stream(),
-        media_type=content_type,
+        generator(),
+        media_type=item["content_type"],
         headers=response_headers,
     )
 
