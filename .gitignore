@@ -6,5 +6,4 @@ venv/
 env/
 downloads/
 *.log
-.env
 .DS_Store

@@ -2,7 +2,8 @@ import os
 import logging
 from typing import Optional
 from contextlib import asynccontextmanager
-from urllib.parse import quote
+from urllib.parse import urlencode
+import re
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -93,12 +94,14 @@ async def get_info(req: InfoRequest):
     if not items:
         raise HTTPException(status_code=404, detail="미디어를 찾을 수 없습니다.")
 
-    encoded_url = quote(req.url, safe="")
     media = [
         MediaItem(
             **{k: v for k, v in item.items()
                if k not in ("ext", "content_type", "title", "direct_url")},
-            stream_url=f"/api/stream?url={encoded_url}&index={item['index']}",
+            stream_url="/api/stream?" + urlencode({
+                "url": req.url,
+                "index": item["index"],
+            }),
         )
         for item in items
     ]
@@ -108,12 +111,17 @@ async def get_info(req: InfoRequest):
 @app.get("/api/stream", summary="미디어 스트리밍 다운로드")
 async def stream_media(
     url: str = Query(..., description="X 게시물 URL"),
-    index: int = Query(0, ge=0, description="미디어 인덱스 (0부터 시작)"),
+    index: str = Query("0", description="미디어 인덱스 (0부터 시작)"),
 ):
     """
     yt-dlp subprocess를 통해 미디어를 서버 저장 없이 클라이언트로 직접 스트리밍합니다.
     HLS, DASH, MP4, 이미지 모두 지원합니다.
     """
+    index_match = re.match(r"^\d+", index.strip())
+    if not index_match:
+        raise HTTPException(status_code=400, detail="index는 0 이상의 정수여야 합니다.")
+    index_value = int(index_match.group(0))
+
     url = normalize_url(url)
     if not is_valid_x_url(url):
         raise HTTPException(status_code=400, detail="유효한 X/Twitter 게시물 URL이 아닙니다.")
@@ -129,13 +137,13 @@ async def stream_media(
     if not items:
         raise HTTPException(status_code=404, detail="미디어를 찾을 수 없습니다.")
 
-    if index >= len(items):
+    if index_value >= len(items):
         raise HTTPException(
             status_code=404,
-            detail=f"인덱스 {index}가 범위를 초과합니다. 총 {len(items)}개의 미디어가 있습니다.",
+            detail=f"인덱스 {index_value}가 범위를 초과합니다. 총 {len(items)}개의 미디어가 있습니다.",
         )
 
-    item = items[index]
+    item = items[index_value]
     response_headers = {
         "Content-Disposition": f'attachment; filename="{item["filename"]}"',
     }
@@ -173,7 +181,7 @@ async def stream_media(
 
     async def fallback_generator():
         try:
-            async for chunk in stream_via_ytdlp(url, index):
+            async for chunk in stream_via_ytdlp(url, index_value):
                 yield chunk
         except RuntimeError as exc:
             logging.error("yt-dlp stream error: %s", exc)
