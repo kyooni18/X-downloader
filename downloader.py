@@ -148,7 +148,10 @@ async def stream_via_ytdlp(url: str, index: int) -> AsyncGenerator[bytes, None]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        # DEVNULL prevents stderr pipe-buffer deadlock:
+        # if yt-dlp writes to stderr faster than we read it, the 64KB kernel
+        # pipe buffer fills up and blocks stdout writes too.
+        stderr=asyncio.subprocess.DEVNULL,
     )
     try:
         while True:
@@ -160,5 +163,4 @@ async def stream_via_ytdlp(url: str, index: int) -> AsyncGenerator[bytes, None]:
         proc.stdout.close()
         rc = await proc.wait()
         if rc != 0:
-            err = await proc.stderr.read()
-            raise RuntimeError(err.decode(errors="replace").strip())
+            raise RuntimeError(f"yt-dlp exited with code {rc}")
